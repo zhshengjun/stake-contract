@@ -183,6 +183,7 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
         require(_startBlock <= _endBlock, StartMustSmallerThanEnd());
 
         __AccessControl_init();
+        __Pausable_init();
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(UPGRADE_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -198,6 +199,14 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
      * 权限认证
      */
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADE_ROLE) {}
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
 
     /**
      * @notice Pause withdraw. Can only be called by admin.
@@ -297,6 +306,9 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
         require(_poolWeight > 0, "invalid pool weight");
 
         // 最小质押数必须大于0
+        require(_minDepositAmount > 0, "invalid min deposit amount");
+
+        // 最小质押数必须大于0
         require(_unstakeLockedBlocks > 0, "invalid withdraw locked blocks");
 
         // 结束块之后，不允许添加质押池
@@ -387,27 +399,6 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     }
 
     /**
-     * @notice 取回质押已经满足区块的token
-     */
-    function withdrawAmount(uint256 _pid, address _user)
-        public
-        view
-        checkPid(_pid)
-        returns (uint256 requestAmount, uint256 pendingWithdrawAmount)
-    {
-        requestAmount = 0;
-        pendingWithdrawAmount = 0;
-        User storage user_ = user[_pid][_user];
-
-        for (uint256 i = 0; i < user_.requests.length; i++) {
-            if (user_.requests[i].unlockBlocks <= block.number) {
-                pendingWithdrawAmount = pendingWithdrawAmount + user_.requests[i].amount;
-            }
-            requestAmount = requestAmount + user_.requests[i].amount;
-        }
-    }
-
-    /**
      * @notice 质押ETH
      */
     function depositETH() public payable whenNotPaused {
@@ -426,7 +417,7 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     function deposit(uint256 _pid, uint256 _amount) public whenNotPaused checkPid(_pid) {
         require(_pid != 0, "deposit not support ETH staking");
         Pool storage pool_ = pool[_pid];
-        require(_amount > pool_.minDepositAmount, "deposit amount is too small");
+        require(_amount >= pool_.minDepositAmount, "deposit amount is too small");
 
         // 需要用户提前执行 approve
         if (_amount > 0) {
@@ -440,7 +431,7 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     /**
      * @notice 解质押
      */
-    function unstake(uint256 _pid, uint256 _amount) public whenNotPaused checkPid(_pid) whenNotWithdrawPaused {
+    function unstake(uint256 _pid, uint256 _amount) public whenNotPaused whenNotWithdrawPaused checkPid(_pid) {
         Pool storage pool_ = pool[_pid];
         User storage user_ = user[_pid][msg.sender];
 
@@ -471,9 +462,30 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     }
 
     /**
+     * @notice 取回质押已经满足区块的token
+     */
+    function withdrawAmount(uint256 _pid)
+        public
+        view
+        checkPid(_pid)
+        returns (uint256 requestAmount, uint256 pendingWithdrawAmount)
+    {
+        requestAmount = 0;
+        pendingWithdrawAmount = 0;
+        User storage user_ = user[_pid][msg.sender];
+
+        for (uint256 i = 0; i < user_.requests.length; i++) {
+            if (user_.requests[i].unlockBlocks <= block.number) {
+                pendingWithdrawAmount = pendingWithdrawAmount + user_.requests[i].amount;
+            }
+            requestAmount = requestAmount + user_.requests[i].amount;
+        }
+    }
+
+    /**
      * @notice 这里将到期的质押取回
      */
-    function withdraw(uint256 _pid) public whenNotPaused checkPid(_pid) whenNotWithdrawPaused {
+    function withdraw(uint256 _pid) public whenNotPaused whenNotWithdrawPaused checkPid(_pid) {
         Pool storage pool_ = pool[_pid];
         User storage user_ = user[_pid][msg.sender];
 
@@ -516,7 +528,7 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
      *
      * @param _pid       Id of the pool to be claimed from
      */
-    function claim(uint256 _pid) public whenNotPaused checkPid(_pid) whenNotClaimPaused {
+    function claim(uint256 _pid) public whenNotPaused whenNotClaimPaused checkPid(_pid) {
         Pool storage pool_ = pool[_pid];
         User storage user_ = user[_pid][msg.sender];
 
@@ -541,6 +553,17 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
 
         // forge-lint: disable-next-line(reentrancy-events)
         emit Claim(msg.sender, _pid, transAmount);
+    }
+
+    function unstakeRequest(uint256 _pid, address _user, uint256 _index)
+        external
+        view
+        checkPid(_pid)
+        returns (uint256 amount, uint256 unlockBlocks)
+    {
+        UnstakeRequest storage request = user[_pid][_user].requests[_index];
+
+        return (request.amount, request.unlockBlocks);
     }
 
     /**

@@ -148,6 +148,8 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     error ClaimAlreadyPaused();
     error ClaimAlreadyUnPaused();
 
+    error InvalidUpgradeAuthority();
+
     // ************************************** MODIFIER **************************************
 
     modifier checkPid(uint256 _pid) {
@@ -176,16 +178,23 @@ contract MetaNodeStake is Initializable, UUPSUpgradeable, PausableUpgradeable, A
     /**
      * 初始化
      */
-    function initialize(IERC20 _metaNode, uint256 _startBlock, uint256 _endBlock, uint256 _metaNodePerBlock)
-        external
-        initializer
-    {
+    function initialize(
+        IERC20 _metaNode,
+        uint256 _startBlock,
+        uint256 _endBlock,
+        uint256 _metaNodePerBlock,
+        address _upgradeAuthority
+    ) external initializer {
         require(_startBlock <= _endBlock, StartMustSmallerThanEnd());
+
+        // 只能证明这是合约地址，不能证明它一定是真多签
+        require(_upgradeAuthority != address(0) && _upgradeAuthority.code.length > 0, InvalidUpgradeAuthority());
 
         __AccessControl_init();
         __Pausable_init();
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(UPGRADE_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, _upgradeAuthority);
+        _grantRole(UPGRADE_ROLE, _upgradeAuthority);
+
         _grantRole(ADMIN_ROLE, msg.sender);
 
         metaNode = _metaNode;

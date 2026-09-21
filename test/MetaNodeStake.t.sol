@@ -3,10 +3,12 @@ pragma solidity ^0.8.10;
 
 import {MetaNodeStake} from "../src/MetaNodeStake.sol";
 import {MetaNodeToken} from "../src/MetaNodeToken.sol";
+import {MultiSigWallet} from "../src/MultiSigWallet.sol";
 import {MyToken} from "./MetaNodeStake.t.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CommonBase} from "forge-std/Base.sol";
@@ -16,6 +18,7 @@ import {StdCheats, StdCheatsSafe} from "forge-std/StdCheats.sol";
 import {StdUtils} from "forge-std/StdUtils.sol";
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 
 contract MyToken is ERC20 {
     constructor() ERC20("MyToken", "MyToken") {}
@@ -36,10 +39,12 @@ contract MetaNodeStakeV2 is MetaNodeStake {
 contract MetaNodeStakePrecisionTest is Test {
     address public learn = 0xb58bbA2158cD9E2d52985D21e863217941600734;
     address public alice = 0x12AFAaa63A92bfe7fFEe7881a10b49EeC4a2F762;
+    address public tim = 0xc2b6c20651dA38CBfCf3279deCD634ab147c0AaD;
     address public owner;
 
     // 质押合约
     MetaNodeStake public stake;
+    MultiSigWallet public multiSigWallet;
     // 奖励币
     MetaNodeToken public metaNode;
 
@@ -54,13 +59,22 @@ contract MetaNodeStakePrecisionTest is Test {
         owner = address(this);
 
         // 部署奖励代币
-        metaNode = new MetaNodeToken();
+        metaNode = new MetaNodeToken(learn);
         MetaNodeStake implementation = new MetaNodeStake();
+
+        // 多签钱包
+        address[] memory owners = new address[](3);
+        owners[0] = address(this);
+        owners[1] = alice;
+        owners[2] = tim;
+        multiSigWallet = new MultiSigWallet(owners, 2);
 
         myToken = new MyToken();
         // 构建 abi编码
-        bytes memory initData =
-            abi.encodeCall(MetaNodeStake.initialize, (IERC20(address(metaNode)), startBlock, endBlock, 1 ether));
+        bytes memory initData = abi.encodeCall(
+            MetaNodeStake.initialize,
+            (IERC20(address(metaNode)), startBlock, endBlock, 1 ether, address(multiSigWallet))
+        );
 
         // 就是代理什么合约，调用的初始化函数是哪个
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
@@ -69,7 +83,9 @@ contract MetaNodeStakePrecisionTest is Test {
         stake = MetaNodeStake(address(proxy));
 
         // 给质押合约准备奖励 Token
-        metaNode.transfer(address(stake), metaNode.balanceOf(address(this)));
+        uint256 rewardBalance = metaNode.balanceOf(learn);
+        vm.prank(learn);
+        metaNode.transfer(address(stake), rewardBalance);
     }
 
     function initPool() private {
@@ -91,11 +107,15 @@ contract MetaNodeStakePrecisionTest is Test {
         assertEq(stake.endBlock(), endBlock);
         assertEq(stake.metaNodePerBlock(), 1 ether);
         assertTrue(stake.hasRole(stake.ADMIN_ROLE(), address(this)));
+        assertTrue(stake.hasRole(stake.DEFAULT_ADMIN_ROLE(), address(multiSigWallet)));
+        assertTrue(stake.hasRole(stake.UPGRADE_ROLE(), address(multiSigWallet)));
+        assertFalse(stake.hasRole(stake.UPGRADE_ROLE(), address(this)));
     }
 
     function test_authorizeUpgrade() public {
         // 必须在 expectRevert 之前部署
         MetaNodeStakeV2 newImplementation = new MetaNodeStakeV2();
+        bytes memory initializeData = abi.encodeCall(MetaNodeStakeV2.initializeV2, (100 ether));
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -103,12 +123,23 @@ contract MetaNodeStakePrecisionTest is Test {
             )
         );
 
-        bytes memory data = abi.encodeCall(MetaNodeStakeV2.initializeV2, (100 ether));
-
         vm.prank(learn);
-        stake.upgradeToAndCall(address(newImplementation), data);
-        // 这里不需要传入初始化，因为代理不需要初始化了，数据已经有了。
-        stake.upgradeToAndCall(address(newImplementation), data);
+        stake.upgradeToAndCall(address(newImplementation), initializeData);
+
+        bytes memory upgradeData = abi.encodeCall(stake.upgradeToAndCall, (address(newImplementation), initializeData));
+        uint256 transactionId = multiSigWallet.submitTransaction(address(stake), 0, upgradeData);
+
+        vm.prank(alice);
+        multiSigWallet.confirmTransaction(transactionId);
+        multiSigWallet.executeTransaction(transactionId);
+
+        assertEq(MetaNodeStakeV2(address(stake)).maxDepositAmount(), 100 ether);
+
+        // 这是获取真正代理的地址
+        bytes32 implementationSlot = bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1);
+        bytes32 implementationValue = vm.load(address(stake), implementationSlot);
+        address actualImplementation = address(uint160(uint256(implementationValue)));
+        assertEq(actualImplementation, address(newImplementation));
     }
 
     // 测试无权，无admin角色
@@ -277,7 +308,7 @@ contract MetaNodeStakePrecisionTest is Test {
         stake.setPoolWeight(1, 0);
 
         vm.expectEmit(address(stake));
-        emit MetaNodeStake.SetPoolWeight(1, 100,150);
+        emit MetaNodeStake.SetPoolWeight(1, 100, 150);
         stake.setPoolWeight(1, 100);
         assertEq(stake.totalPoolWeight(), 150);
     }
@@ -372,18 +403,13 @@ contract MetaNodeStakePrecisionTest is Test {
         myToken.approve(address(stake), 100 ether);
         stake.deposit(1, 6 ether);
 
-
-
         assertEq(myToken.balanceOf(learn), 94 ether);
         assertEq(myToken.balanceOf(address(stake)), 6 ether);
 
         vm.roll(startBlock + 100);
         stake.unstake(1, 1 ether);
 
-        assertGt(
-            stake.pendingMetaNode(1, learn),
-            0
-        );
+        assertGt(stake.pendingMetaNode(1, learn), 0);
 
         // 没有足够的额度
         vm.expectRevert(bytes("Not enough staking token balance"));
@@ -479,8 +505,10 @@ contract MetaNodeStakePrecisionTest is Test {
         assertEq(amount, 6 ether);
         assertEq(pending, 5 ether);
 
+        // 取回质押
         stake.withdraw(1);
 
+        // 解压队列
         (uint256 stAmount, uint256 finishedMetaNode, uint256 pendingMetaNode) = stake.user(1, learn);
         assertEq(stAmount, 1000000000000000000);
         assertEq(finishedMetaNode, 41446428571428571428);
